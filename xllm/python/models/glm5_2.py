@@ -306,7 +306,7 @@ class Glm52Config:
             intermediate_size=int(pick("intermediate_size", default=12288)),
             vocab_size=int(pick("vocab_size", default=154880)),
             rms_norm_eps=float(pick("rms_norm_eps", default=1e-5)),
-            rope_theta=float(pick("rope_theta", default=1.0e6)),
+            rope_theta=float(rpick("rope_theta", default=1.0e6)),
             max_position_embeddings=max_pe,
             original_max_position_embeddings=original_max,
             rope_scaling_factor=rope_scaling_factor,
@@ -554,6 +554,7 @@ class Glm52MLAAttention(Attention):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         prev_topk_indices: torch.Tensor | None = None,
+        reuse_topk_indices: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = hidden.shape[0]
         q_a = self.q_a_proj(hidden)
@@ -566,7 +567,11 @@ class Glm52MLAAttention(Attention):
         )
         layer_owner = self.layer_id % self.cfg.layerwise_split_size
         owns_layer_cache = self.cfg.layerwise_split_rank == layer_owner
-        if self.indexer is not None:
+        if reuse_topk_indices:
+            if prev_topk_indices is None:
+                raise ValueError("MTP DSA top-k reuse requires indices from the previous draft step")
+            topk = prev_topk_indices
+        elif self.indexer is not None:
             ctx = backend.mla_index_context(self)
             if layerwise:
                 if owns_layer_cache:
@@ -880,13 +885,20 @@ class Glm52DecoderLayer(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         prev_topk_indices: torch.Tensor | None = None,
+        reuse_topk_indices: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden
             hidden = self.input_layernorm(hidden)
         else:
             hidden, residual = self.input_layernorm(hidden, residual)
-        hidden, topk_indices = self.self_attn(hidden, positions, cos_sin_cache, prev_topk_indices)
+        hidden, topk_indices = self.self_attn(
+            hidden,
+            positions,
+            cos_sin_cache,
+            prev_topk_indices,
+            reuse_topk_indices,
+        )
         hidden, residual = self.post_attention_layernorm(hidden, residual)
         hidden = self.mlp(hidden)
         return hidden, residual, topk_indices
@@ -947,7 +959,7 @@ class Glm52Model(nn.Module):
 class Glm52ForCausalLM(PyModelBase):
     """GLM-5.2 causal LM. Registered under ``model_type='glm_moe_dsa'``."""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, build_model: bool = True) -> None:
         super().__init__()
         self.cfg = Glm52Config.from_dict(config)
         self.cfg.tp_size = int(config.get("tp_size", 1))
@@ -970,14 +982,21 @@ class Glm52ForCausalLM(PyModelBase):
         self.device = device
         tp = self.cfg.tp_size
         assert self.cfg.vocab_size % tp == 0
-        self.model = Glm52Model(self.cfg, dtype, device)
+        self.model: nn.Module | None = None
+        self.lm_head: nn.Module | None = None
+        if build_model:
+            self._build_model()
+
+    def _build_model(self) -> None:
+        tp = self.cfg.tp_size
+        self.model = Glm52Model(self.cfg, self.dtype, self.device)
         self.lm_head = ColumnParallelLinear(
             self.cfg.hidden_size,
             self.cfg.vocab_size // tp,
             tp,
             gather_output=True,
-            dtype=dtype,
-            device=device,
+            dtype=self.dtype,
+            device=self.device,
         )
 
     def load_weights(
@@ -985,11 +1004,18 @@ class Glm52ForCausalLM(PyModelBase):
         state_dicts: list,
         tp_rank: int,
         tp_size: int,
+        load_lm_head: bool = True,
+        load_embedding: bool = True,
+        loader: W8A8WeightLoader | None = None,
     ) -> None:
         cfg = self.cfg
-        loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
+        if loader is None:
+            loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
+        if self.model is None:
+            raise RuntimeError("GLM model body must be built before loading weights")
 
-        loader.copy_shard("model.embed_tokens.weight", dim=1)
+        if load_embedding:
+            loader.copy_shard("model.embed_tokens.weight", dim=1)
 
         for i in range(cfg.n_layers):
             p = f"model.layers.{i}."
@@ -1034,4 +1060,5 @@ class Glm52ForCausalLM(PyModelBase):
             self.model.layers[i].mlp.load_from_checkpoint(loader, p + "mlp.")
 
         loader.copy_replicated("model.norm.weight")
-        loader.copy_shard("lm_head.weight", dim=0)
+        if load_lm_head:
+            loader.copy_shard("lm_head.weight", dim=0)
