@@ -334,7 +334,9 @@ def test_glm_weight_loader_shards_proper_divisor_ep_with_moe_tp(monkeypatch) -> 
 
 
 @pytest.mark.parametrize("dynamic_activation", [False, True])
-def test_glm_attention_selects_checkpoint_quantization(dynamic_activation: bool, monkeypatch) -> None:
+def test_glm_attention_selects_checkpoint_quantization(
+    dynamic_activation: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     model = Glm52ForCausalLM(_config(ep_rank=2))
     attention = model.model.layers[0].self_attn
     attention.process_weights_after_loading = MagicMock()
