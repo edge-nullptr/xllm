@@ -156,6 +156,7 @@ def test_mtp_ignores_target_layer_metadata_with_mismatched_depth() -> None:
             first_k_dense_replace=0,
             indexer_types=["full", "shared"],
             mlp_layer_types=["dense", "dense"],
+            index_topk_pattern="",
         )
     )
 
