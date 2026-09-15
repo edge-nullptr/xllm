@@ -526,8 +526,13 @@ class Glm52MLAAttention(Attention):
             torch.empty(num_heads, kv_lora, v_head, dtype=dtype, device=device),
             persistent=False,
         )
+        # MTP shared layers need a real indexer for the first draft step. The
+        # native executor disables top-k reuse for that step, then reuses the
+        # produced indices on later steps.
+        is_mtp_topk_fallback = cfg.model_type.endswith("_mtp") and cfg.index_share_for_mtp_iteration
         self.is_shared = (
-            cfg.indexer_types is not None
+            not is_mtp_topk_fallback
+            and cfg.indexer_types is not None
             and layer_id < len(cfg.indexer_types)
             and cfg.indexer_types[layer_id] == "shared"
         )

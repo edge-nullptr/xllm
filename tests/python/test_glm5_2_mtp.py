@@ -140,6 +140,13 @@ def test_mtp_constructor_defers_shared_target_modules() -> None:
     assert draft.model.embed_tokens is target_embedding
 
 
+def test_mtp_builds_fallback_indexer_for_pattern_shared_layers() -> None:
+    draft = glm5_2_mtp.Glm52MtpForCausalLM(_config(indexer_types=None, index_topk_pattern="S"))
+
+    assert draft.cfg.indexer_types == ["shared"]
+    assert draft.model.layers[0].self_attn.indexer is not None
+
+
 def test_glm53_reads_rope_theta_from_rope_parameters() -> None:
     cfg = glm5_2_mtp.Glm52Config.from_dict(
         _config(
