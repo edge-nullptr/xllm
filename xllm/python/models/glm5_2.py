@@ -756,7 +756,8 @@ class Glm52Indexer(nn.Module):
         index_cache = ctx.index_cache
         index_cache_scale = ctx.index_cache_scale
         k_scale = None
-        if index_cache.dtype == torch.int8 and index_cache_scale is not None:
+        use_quant_indexer = index_cache.dtype == torch.int8 and index_cache_scale is not None
+        if use_quant_indexer:
             rotation_scale = self.head_dim**-0.5
             k = torch.matmul(k, self.hadamard) * rotation_scale
             k, k_scale = kernels.dynamic_quant(k)
