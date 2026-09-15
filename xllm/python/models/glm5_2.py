@@ -574,6 +574,10 @@ class Glm52MLAAttention(Attention):
         if reuse_topk_indices:
             if prev_topk_indices is None:
                 raise ValueError("MTP DSA top-k reuse requires indices from the previous draft step")
+            if self.indexer is not None:
+                ctx = backend.mla_index_context(self)
+                if not layerwise or owns_layer_cache:
+                    self.indexer._update_index_cache(hidden, positions, ctx, cos_sin_cache)
             topk = prev_topk_indices
         elif self.indexer is not None:
             ctx = backend.mla_index_context(self)
@@ -724,6 +728,37 @@ class Glm52Indexer(nn.Module):
         )
         return q, q_scale, weights
 
+    def _update_index_cache(
+        self,
+        cache_hidden: torch.Tensor,
+        cache_positions: torch.Tensor,
+        ctx: MlaIndexContext,
+        cos_sin_cache: torch.Tensor,
+    ) -> None:
+        k = self.wk(cache_hidden)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
+        if self.indexer_rope_interleave:
+            k_cos, k_sin = _gather_interleave_cos_sin(cos_sin_cache, cache_positions)
+            k_pe = _interleave_rope_with(k_pe.unsqueeze(1), k_cos, k_sin).squeeze(1)
+        else:
+            k_pe = _apply_half_rope(cos_sin_cache, k_pe.unsqueeze(1), cache_positions).squeeze(1)
+        k = torch.cat([k_pe, k_nope], dim=-1)
+        if ctx.cp_context is not None:
+            # Only the padded K rows obey the equal-size CP gather contract.
+            k = cp_gather_kv(k, ctx.cp_context).contiguous()
+
+        index_cache = ctx.index_cache
+        index_cache_scale = ctx.index_cache_scale
+        k_scale = None
+        if index_cache.dtype == torch.int8 and index_cache_scale is not None:
+            rotation_scale = self.head_dim**-0.5
+            k = torch.matmul(k, self.hadamard) * rotation_scale
+            k, k_scale = kernels.dynamic_quant(k)
+            assert k_scale is not None
+            k_scale = k_scale.unsqueeze(-1).to(torch.float16)
+        ctx.update_index_cache(k, k_scale)
+
     def select_qli(
         self,
         hidden: torch.Tensor,
@@ -738,31 +773,10 @@ class Glm52Indexer(nn.Module):
         actual_seq_kv = ctx.actual_seq_kv
         cache_hidden = hidden if cache_hidden is None else cache_hidden
         cache_positions = positions if cache_positions is None else cache_positions
-        k = self.wk(cache_hidden)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        if self.indexer_rope_interleave:
-            k_cos, k_sin = _gather_interleave_cos_sin(cos_sin_cache, cache_positions)
-            k_pe = _interleave_rope_with(k_pe.unsqueeze(1), k_cos, k_sin).squeeze(1)
-        else:
-            k_pe = _apply_half_rope(cos_sin_cache, k_pe.unsqueeze(1), cache_positions).squeeze(1)
-        k = torch.cat([k_pe, k_nope], dim=-1)
-        if ctx.cp_context is not None:
-            # Q/weights already contain only this rank's real query rows;
-            # only the padded K rows obey the equal-size CP gather contract.
-            k = cp_gather_kv(k, ctx.cp_context).contiguous()
-
+        self._update_index_cache(cache_hidden, cache_positions, ctx, cos_sin_cache)
         index_cache = ctx.index_cache
         index_cache_scale = ctx.index_cache_scale
         use_quant_indexer = index_cache.dtype == torch.int8 and index_cache_scale is not None
-        k_scale = None
-        if use_quant_indexer:
-            rotation_scale = self.head_dim**-0.5
-            k = torch.matmul(k, self.hadamard) * rotation_scale
-            k, k_scale = kernels.dynamic_quant(k)
-            assert k_scale is not None
-            k_scale = k_scale.unsqueeze(-1).to(torch.float16)
-        ctx.update_index_cache(k, k_scale)
         index_cache, index_cache_scale, block_table = ctx.materialize_index_cache()
         if ctx.cp_context is not None and ctx.cp_context.query_index.numel() == 0:
             # Other ranks still need this rank's keys/cache materialization.
@@ -784,6 +798,7 @@ class Glm52Indexer(nn.Module):
         q = torch.cat([q_pe, q_nope], dim=-1)
         weights = self.weights_proj(hidden)
         if use_quant_indexer:
+            rotation_scale = self.head_dim**-0.5
             q = torch.matmul(q, self.hadamard) * rotation_scale
             q, q_scale = kernels.dynamic_quant(q)
             assert q_scale is not None
