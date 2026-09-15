@@ -310,6 +310,23 @@ torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
   return out.cast<torch::Tensor>();
 }
 
+torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
+                                 const torch::Tensor& seleted_idxes,
+                                 torch::Tensor& out_hidden) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+
+  py::object selected = optional_tensor(seleted_idxes);
+  if (seleted_idxes.defined() && seleted_idxes.numel() > 0) {
+    out_hidden = hidden_states.index_select(
+        /*dim=*/0, seleted_idxes.to(torch::kLong));
+  } else {
+    out_hidden = hidden_states;
+  }
+  py::object out = py_model_.attr("compute_logits")(hidden_states, selected);
+  return out.cast<torch::Tensor>();
+}
+
 ModelOutput PyCausalLM::write_context_kv(
     const torch::Tensor& target_hidden,
     const torch::Tensor& positions,
