@@ -150,6 +150,19 @@ def test_glm53_reads_rope_theta_from_rope_parameters() -> None:
     assert cfg.rope_theta == 8_000_000
 
 
+def test_mtp_ignores_target_layer_metadata_with_mismatched_depth() -> None:
+    cfg = glm5_2_mtp.Glm52Config.from_dict(
+        _config(
+            first_k_dense_replace=0,
+            indexer_types=["full", "shared"],
+            mlp_layer_types=["dense", "dense"],
+        )
+    )
+
+    assert cfg.indexer_types == ["full"]
+    assert cfg.mlp_layer_types == ["sparse"]
+
+
 def test_mtp_reuses_external_topk_and_emits_fallback_topk() -> None:
     body, layer = _mtp_body()
     input_ids = torch.tensor([1, 2])

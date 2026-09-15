@@ -397,7 +397,9 @@ class Glm52Config:
     def _resolve_indexer_types(self) -> None:
         """Derive per-layer indexer mode (full/shared)."""
         if self.indexer_types is not None:
-            return
+            if len(self.indexer_types) == self.n_layers:
+                return
+            self.indexer_types = None
         pattern = self.index_topk_pattern
         if pattern:
             if isinstance(pattern, str):
@@ -414,7 +416,9 @@ class Glm52Config:
     def _resolve_mlp_layer_types(self) -> None:
         """Derive per-layer MLP mode (dense/sparse)."""
         if self.mlp_layer_types is not None:
-            return
+            if len(self.mlp_layer_types) == self.n_layers:
+                return
+            self.mlp_layer_types = None
         n_dense = min(self.first_k_dense_replace, self.n_layers)
         self.mlp_layer_types = ["dense"] * n_dense + ["sparse"] * (self.n_layers - n_dense)
 
